@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Pac‑Man (Simple)</title>
+<style>
+  :root{--bg:#410a33;--wall:#ffffff;--pellet:#878835;--power:#922020;--pac:#200d8a;--ghost1:#ff6b6b;--ghost2:#18515e;--ghost3:#b76bff}
+  html,body{height:100%;margin:0;background:var(--bg);color:#ffffff;font-family:system-ui,Segoe UI,Roboto}
+  .wrap{display:flex;flex-direction:column;align-items:center;padding:12px;gap:8px}
+  canvas{background:#000;border:6px solid #08122a;image-rendering:pixelated}
+  .controls{display:flex;gap:8px;align-items:center;margin-bottom:6px}
+  .hud{display:flex;gap:12px;align-items:center}
+  button{padding:6px 10px;border-radius:6px;border:none;background:#0b5;cursor:pointer;color:#002}
+  .btn-ghost{background:#e6eefb;color:#072}
+  .info{font-size:14px}
+  .credit{font-size:12px;color:#9aa}
+  .overlay{
+    position:absolute;left:0;top:0;width:100%;height:100%;display:flex;align-items:center;justify-content:center;
+    pointer-events:none;color:#fff;font-weight:700;text-shadow:0 2px 8px rgba(0,0,0,0.6)
+  }
+  .ui-row{display:flex;gap:8px;align-items:center}
+  label{font-size:13px;color:#ddd}
+  input[type=range]{width:140px}
+  select{padding:6px;border-radius:6px}
+  .container{position:relative;display:inline-block}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h2>Pac‑Man — simple clone</h2>
+
+  <div class="controls ui-row">
+    <div class="hud">
+      <div class="info">Score: <span id="score">0</span></div>
+      <div class="info">Lives: <span id="lives">3</span></div>
+    </div>
+
+    <div class="ui-row">
+      <button id="start">Start</button>
+      <button id="pause" class="btn-ghost">Pause</button>
+      <button id="restart">Restart</button>
+    </div>
+
+    <div class="ui-row" style="margin-left:8px">
+      <label for="speed">Speed</label>
+      <input id="speed" type="range" min="0.5" max="3" step="0.1" value="1">
+      <label for="difficulty">Difficulty</label>
+      <select id="difficulty">
+        <option value="0.9">Easy</option>
+        <option value="1.0" selected>Normal</option>
+        <option value="1.2">Hard</option>
+        <option value="1.5">Insane</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="container">
+    <canvas id="game" width="448" height="496"></canvas>
+    <div id="overlay" class="overlay" aria-hidden="true" style="pointer-events:none;"></div>
+  </div>
+
+  <div class="credit">Use arrow keys or WASD. Eat pellets. Eat power pellets to turn ghosts blue.</div>
+</div>
+
+<script>
+/* Fixed & enhanced Pac‑Man:
+ - bug fixes (map checks, reset/ghost spawn ordering)
+ - programmable interface: Start / Pause / Restart, speed slider, difficulty multipler
+*/
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const scoreEl = document.getElementById('score');
+const livesEl = document.getElementById('lives');
+const restartBtn = document.getElementById('restart');
+const startBtn = document.getElementById('start');
+const pauseBtn = document.getElementById('pause');
+const speedInput = document.getElementById('speed');
+const difficultySelect = document.getElementById('difficulty');
+const overlay = document.getElementById('overlay');
+
+const CELL = 16;
+const COLS = 28;
+const ROWS = 31;
+canvas.width = COLS * CELL;
+canvas.height = ROWS * CELL + 32;
+
+let score = 0;
+let lives = 3;
+let gameOver = false;
+let levelMap;
+let pelletsRemaining = 0;
+
+let running = false; // running state for Start/Pause
+let ghostSpeedMultiplier = 1.0;
+
+const DIR = {NONE:0, LEFT:1, UP:2, RIGHT:3, DOWN:4};
+const VEC = {1:[-1,0],2:[0,-1],3:[1,0],4:[0,1]};
+
+function makeMap(){
+  const m = Array.from({length: ROWS},()=>Array(COLS).fill(2));
+  for(let r=0;r<ROWS;r++){
+    for(let c=0;c<COLS;c++){
+      if(r===0||r===ROWS-1||c===0||c===COLS-1) m[r][c]=1;
+      if((r%2===0 && c%6<2) && r>2 && r<ROWS-3) m[r][c]=1;
+      if((c%5===0 && r%4<2) && c>2 && c<COLS-3) m[r][c]=1;
+    }
+  }
+  const corners = [[1,1],[1,COLS-2],[ROWS-2,1],[ROWS-2,COLS-2]];
+  for(const [r,c] of corners) m[r][c]=3;
+  for(let r=13;r<17;r++) for(let c=12;c<16;c++) m[r][c]=0;
+
+  pelletsRemaining = 0;
+  for(let r=0;r<ROWS;r++) for(let c=0;c<COLS;c++){
+    if(m[r][c]===2 || m[r][c]===3) pelletsRemaining++;
+  }
+  return m;
+}
+
+function updateHUD(){
+  scoreEl.textContent = score;
+  livesEl.textContent = lives;
+}
+
+const pac = {
+  r: ROWS-3, c: Math.floor(COLS/2),
+  x:0,y:0, dir: DIR.NONE, req: DIR.NONE, speed: 2.0, radius: CELL/2 - 1, powered:0,
+  reset(){
+    this.r = ROWS-3; this.c = Math.floor(COLS/2);
+    this.x = this.c*CELL + CELL/2;
+    this.y = this.r*CELL + CELL/2;
+    this.dir = DIR.NONE; this.req = DIR.NONE; this.powered=0;
+    this.speed = 2.0 * Number(speedInput.value);
+  },
+  update(){
+    if(this.req!==DIR.NONE){
+      const [dx,dy] = VEC[this.req] || [0,0];
+      const nc = Math.floor((this.x + dx*this.speed + CELL/2)/CELL);
+      const nr = Math.floor((this.y + dy*this.speed + CELL/2)/CELL);
+      if(!isWall(nr,nc)) this.dir = this.req;
+      this.req = DIR.NONE;
+    }
+    if(this.dir!==DIR.NONE){
+      const [dx,dy] = VEC[this.dir];
+      this.x += dx*this.speed;
+      this.y += dy*this.speed;
+      const nc = Math.floor((this.x)/CELL);
+      const nr = Math.floor((this.y)/CELL);
+      if(isWall(nr + (dy>0?1:dy<0?-1:0), nc + (dx>0?1:dx<0?-1:0))){
+        const cx = nc*CELL + CELL/2;
+        const cy = nr*CELL + CELL/2;
+        if(Math.abs(this.x - cx) < this.speed && Math.abs(this.y - cy) < this.speed){
+          this.x = cx; this.y = cy; this.dir = DIR.NONE;
+        }
+      }
+    }
+    this.c = Math.floor(this.x / CELL);
+    this.r = Math.floor(this.y / CELL);
+
+    // fixed check: ensure we index row then column
+    if(levelMap[this.r] && levelMap[this.r][this.c]===2){
+      levelMap[this.r][this.c]=0; score+=10; pelletsRemaining--;
+    } else if(levelMap[this.r] && levelMap[this.r][this.c]===3){
+      levelMap[this.r][this.c]=0; score+=50; pelletsRemaining--;
+      this.powered = 600;
+      ghosts.forEach(g=>g.frighten());
+    }
+    if(this.powered>0) this.powered--;
+  },
+  draw(){
+    const ang = 0.25*Math.PI*Math.sin(Date.now()/120);
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--pac') || '#ffd43b';
+    ctx.beginPath();
+    ctx.moveTo(this.x,this.y);
+    let start = ang, end = 2*Math.PI - ang;
+    if(this.dir===DIR.LEFT) { start = Math.PI - ang; end = Math.PI + ang; }
+    if(this.dir===DIR.UP) { start = -Math.PI/2 - ang; end = -Math.PI/2 + ang; }
+    if(this.dir===DIR.DOWN) { start = Math.PI/2 - ang; end = Math.PI/2 + ang; }
+    ctx.arc(this.x,this.y,this.radius,start,end);
+    ctx.lineTo(this.x,this.y);
+    ctx.fill();
+  }
+};
+
+function isWall(r,c){
+  if(!levelMap) return true;
+  if(r<0||r>=ROWS||c<0||c>=COLS) return true; 
+  return levelMap[r][c]===1;
+}
+
+class Ghost{
+  constructor(color, r, c){
+    this.startR=r; this.startC=c;
+    this.r=r; this.c=c;
+    this.x = c*CELL + CELL/2;
+    this.y = r*CELL + CELL/2;
+    this.dir = DIR.NONE;
+    this.baseSpeed = 1.4;
+    this.color = color;
+    this.mode = 'chase';
+    this.fright = 0;
+  }
+  reset(){
+    this.r=this.startR; this.c=this.startC;
+    this.x = this.c*CELL + CELL/2;
+    this.y = this.r*CELL + CELL/2;
+    this.dir = DIR.NONE;
+    this.fright = 0;
+    this.mode='chase';
+  }
+  frighten(){ this.fright = 600; this.mode='fright'; }
+  update(){
+    if(this.fright>0){
+      this.fright--;
+      if(this.fright===0) this.mode='chase';
+    }
+    const cx = Math.round(this.c*CELL + CELL/2);
+    const cy = Math.round(this.r*CELL + CELL/2);
+    if((Math.abs(this.x - cx) < 0.01 && Math.abs(this.y - cy) < 0.01) || this.dir===DIR.NONE){
+      const choices = [];
+      for(let d of [DIR.LEFT,DIR.UP,DIR.RIGHT,DIR.DOWN]){
+        const [dx,dy] = VEC[d];
+        const nr = this.r + dy;
+        const nc = this.c + dx;
+        if(!isWall(nr,nc)) choices.push(d);
+      }
+      const opposite = {1:3,3:1,2:4,4:2};
+      const back = opposite[this.dir] || null;
+      const filtered = choices.filter(d=>d!==back);
+      const pickFrom = filtered.length?filtered:choices;
+      let next;
+      if(this.mode==='fright'){
+        next = pickFrom[Math.floor(Math.random()*pickFrom.length)];
+      } else {
+        let best = pickFrom[0], bestD = 1e9;
+        for(const d of pickFrom){
+          const [dx,dy] = VEC[d];
+          const nr = this.r + dy;
+          const nc = this.c + dx;
+          const dist = Math.hypot((nc - pac.c),(nr - pac.r));
+          if(dist < bestD){ bestD = dist; best = d; }
+        }
+        next = best;
+      }
+      this.dir = next;
+    }
+    const [dx,dy] = VEC[this.dir] || [0,0];
+    const speed = this.baseSpeed * ghostSpeedMultiplier * Number(speedInput.value);
+    this.x += dx*speed;
+    this.y += dy*speed;
+    this.c = Math.floor(this.x / CELL);
+    this.r = Math.floor(this.y / CELL);
+  }
+  draw(){
+    ctx.save();
+    ctx.translate(this.x,this.y);
+    ctx.fillStyle = (this.fright>0)?'#4fc3f7':this.color;
+    ctx.beginPath();
+    ctx.moveTo(-CELL/2+1,0);
+    ctx.arc(0,0,CELL/2-1,Math.PI,0);
+    ctx.lineTo(CELL/2-1,CELL/2-1);
+    for(let i=1;i<=3;i++){
+      const x = CELL/2-1 - i*(CELL/6);
+      ctx.quadraticCurveTo(x - 6*(i%2?1:-1), CELL/2-1 - 6, x - CELL/6, CELL/2-1);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(-6, -2, 4, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(6, -2, 4, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#000';
+    ctx.beginPath(); ctx.arc(-6 + (pac.x>this.x?1:-1), -2, 2, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(6 + (pac.x>this.x?1:-1), -2, 2, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+}
+
+let ghosts = [];
+
+function spawnGhosts(){
+  ghosts = [
+    new Ghost(getComputedStyle(document.documentElement).getPropertyValue('--ghost1') || '#ff6b6b', 14, 13),
+    new Ghost(getComputedStyle(document.documentElement).getPropertyValue('--ghost2') || '#6be5ff', 14, 14),
+    new Ghost(getComputedStyle(document.documentElement).getPropertyValue('--ghost3') || '#b76bff', 15, 13)
+  ];
+}
+
+function drawMap(){
+  for(let r=0;r<ROWS;r++){
+    for(let c=0;c<COLS;c++){
+      const v = levelMap[r][c];
+      const x = c*CELL, y = r*CELL;
+      if(v===1){
+        ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--wall') || '#001f6b';
+        ctx.fillRect(x,y,CELL,CELL);
+        ctx.fillStyle = '#03204a';
+        ctx.fillRect(x+2,y+2,CELL-4,CELL-4);
+      } else {
+        if(v===2){
+          ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--pellet') || '#ffd166';
+          ctx.beginPath(); ctx.arc(x+CELL/2,y+CELL/2,2,0,Math.PI*2); ctx.fill();
+        } else if(v===3){
+          ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--power') || '#ff6b6b';
+          ctx.beginPath(); ctx.arc(x+CELL/2,y+CELL/2,5,0,Math.PI*2); ctx.fill();
+        } else {
+          // clear cell background slightly (optional)
+          ctx.fillStyle = 'rgba(0,0,0,0)';
+          ctx.fillRect(x,y,CELL,CELL);
+        }
+      }
+    }
+  }
+}
+
+function checkCollisions(){
+  for(const g of ghosts){
+    const d = Math.hypot(pac.x - g.x, pac.y - g.y);
+    if(d < CELL/2){
+      if(pac.powered>0 || g.fright>0){
+        score += 200;
+        g.reset();
+      } else {
+        lives--;
+        updateHUD();
+        if(lives<=0){
+          gameOver = true;
+          running = false;
+        } else {
+          pac.reset();
+          ghosts.forEach(g=>g.reset());
+        }
+      }
+    }
+  }
+}
+
+function drawHUDOverlay(text){
+  overlay.style.display = 'flex';
+  overlay.textContent = text;
+}
+
+function clearOverlay(){
+  overlay.style.display = 'none';
+  overlay.textContent = '';
+}
+
+let lastTime = 0;
+function loop(t){
+  requestAnimationFrame(loop);
+  if(!running){
+    // draw static frame so players see initial state
+    return;
+  }
+  if(gameOver){
+    ctx.fillStyle='#000';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle='#fff';
+    ctx.font='24px system-ui';
+    ctx.textAlign='center';
+    ctx.fillText('GAME OVER', canvas.width/2, canvas.height/2);
+    ctx.font='14px system-ui';
+    ctx.fillText('Press Restart to play again', canvas.width/2, canvas.height/2+28);
+    drawHUDOverlay('GAME OVER');
+    return;
+  }
+  const dt = t - lastTime; lastTime = t;
+  pac.update();
+  ghosts.forEach(g=>g.update());
+  checkCollisions();
+  if(pelletsRemaining<=0){
+    ctx.fillStyle='#000';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle='#fff';
+    ctx.font='22px system-ui';
+    ctx.textAlign='center';
+    ctx.fillText('YOU WIN!', canvas.width/2, canvas.height/2);
+    gameOver = true;
+    running = false;
+    drawHUDOverlay('YOU WIN!');
+    return;
+  }
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  drawMap();
+  pac.draw();
+  ghosts.forEach(g=>g.draw());
+  updateHUD();
+  clearOverlay();
+}
+
+// input
+document.addEventListener('keydown', e=>{
+  const key = e.key;
+  if(key==='ArrowLeft'||key==='a'||key==='A') pac.req = DIR.LEFT;
+  if(key==='ArrowRight'||key==='d'||key==='D') pac.req = DIR.RIGHT;
+  if(key==='ArrowUp'||key==='w'||key==='W') pac.req = DIR.UP;
+  if(key==='ArrowDown'||key==='s'||key==='S') pac.req = DIR.DOWN;
+  if(key===' '){ // space toggles pause
+    togglePause();
+  }
+});
+
+function resetGame(){
+  levelMap = makeMap();
+  if(!ghosts || ghosts.length===0) spawnGhosts();
+  score = 0;
+  lives = 3;
+  gameOver = false;
+  pac.reset();
+  ghosts.forEach(g=>g.reset());
+  updateHUD();
+  clearOverlay();
+}
+
+restartBtn.addEventListener('click', ()=>{
+  resetGame();
+  running = true;
+});
+
+startBtn.addEventListener('click', ()=>{
+  if(gameOver){
+    resetGame();
+  }
+  running = true;
+});
+
+function togglePause(){
+  running = !running;
+  if(!running) drawHUDOverlay('PAUSED');
+  else clearOverlay();
+}
+pauseBtn.addEventListener('click', togglePause);
+
+speedInput.addEventListener('input', ()=>{
+  pac.speed = 2.0 * Number(speedInput.value);
+});
+
+difficultySelect.addEventListener('change', ()=>{
+  ghostSpeedMultiplier = Number(difficultySelect.value);
+});
+
+// initialize and draw initial frame
+levelMap = makeMap();
+spawnGhosts();
+pac.reset();
+ghosts.forEach(g=>g.reset());
+updateHUD();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
